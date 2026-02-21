@@ -102,10 +102,24 @@ def compute_ceiling_and_remanent(expenses: List[SimpleTransaction]) -> List[Tran
         for e in expenses
     ]
 
-def validate_and_enrich_transactions(transactions: List[SimpleTransaction]) -> Dict[str, List[Dict]]:
+def validate_and_enrich_transactions(
+    transactions: List[SimpleTransaction],
+    wage: float = 0.0
+) -> Dict[str, List[Dict]]:
+    """
+    Validates transactions:
+    - Negative amounts not allowed
+    - Duplicate transactions not allowed
+    - Total remanent across all transactions must not exceed 10% of wage
+    Enriches with ceiling/remanent values.
+    """
     valid, invalid, seen = [], [], set()
 
     enriched = compute_ceiling_and_remanent(transactions)
+
+    # Rule: total remanent must not exceed 10% of wage
+    max_remanent = wage * 0.10 if wage > 0 else float("inf")
+    total_remanent = sum(tx.remanent for tx in enriched)
 
     for tx in enriched:
         key = (tx.date, tx.amount)
@@ -118,8 +132,34 @@ def validate_and_enrich_transactions(transactions: List[SimpleTransaction]) -> D
             seen.add(key)
             valid.append(tx)
 
+    # If total remanent exceeds wage threshold, mark all as invalid
+    if total_remanent > max_remanent:
+        invalid.extend([{**tx.dict(), "message": f"Total remanent {total_remanent} exceeds 10% of wage ({max_remanent})"} for tx in valid])
+        valid = []
+
     return {"valid": valid, "invalid": invalid}
 
+
+def process_remanent_logic(tx_date: str, tx_amount: float, q_list: List[Period], p_list: List[Period]) -> float:
+    """Applies Q override and P addition logic for remanent (returns only)."""
+    tx_dt = datetime.strptime(tx_date, "%Y-%m-%d %H:%M:%S")
+
+    # Step 1: Rounding
+    ceiling = math.ceil(tx_amount / 100) * 100
+    rem = round(ceiling - tx_amount, 2)
+
+    # Step 2: Q Override (latest start wins)
+    matching_q = [q for q in q_list if datetime.strptime(q.start, "%Y-%m-%d %H:%M:%S") <= tx_dt <= datetime.strptime(q.end, "%Y-%m-%d %H:%M:%S")]
+    if matching_q:
+        matching_q.sort(key=lambda x: x.start, reverse=True)
+        rem = matching_q[0].fixed
+
+    # Step 3: P Addition
+    for p in p_list:
+        if datetime.strptime(p.start, "%Y-%m-%d %H:%M:%S") <= tx_dt <= datetime.strptime(p.end, "%Y-%m-%d %H:%M:%S"):
+            rem += p.extra
+
+    return rem
 # ---------------------------------------------------------
 # API Endpoints
 # ---------------------------------------------------------
@@ -132,10 +172,10 @@ def parse_transactions(expenses: List[SimpleTransaction]):
 
 @app.post("/blackrock/challenge/v1/transactions:validator")
 def validate_transactions(req: ValidatorRequest):
-    result = validate_and_enrich_transactions([
-        SimpleTransaction(date=tx.date, amount=tx.amount)
-        for tx in req.transactions
-    ])
+    result = validate_and_enrich_transactions(
+        [SimpleTransaction(date=tx.date, amount=tx.amount) for tx in req.transactions],
+        wage=req.wage 
+    )
     return result
 
 @app.post("/blackrock/challenge/v1/transactions:filter")
@@ -160,20 +200,29 @@ def filter_transactions(req: FilterRequest):
 
     return {"valid": valid, "invalid": invalid}
 
+
 def calculate_returns(req: ReturnsRequest, rate: float, is_nps: bool):
-    # Step 1: Validate and enrich transactions
+    # Step 1: Validate and enrich transactions (basic rounding first)
     validation_result = validate_and_enrich_transactions([
         SimpleTransaction(date=tx.date, amount=tx.amount)
         for tx in req.transactions
     ])
     valid_transactions = validation_result["valid"]
 
-    # Step 2: Apply k-period filtering
+    # Step 2: Apply k-period filtering + Q/P remanent logic
     filtered_transactions = []
     for tx in valid_transactions:
         tx_dt = parse_date(tx.date)
         if any(parse_date(k.start) <= tx_dt <= parse_date(k.end) for k in req.k):
-            filtered_transactions.append(tx)
+            rem = process_remanent_logic(tx.date, tx.amount, req.q, req.p)
+            filtered_transactions.append(
+                Transaction(
+                    date=tx.date,
+                    amount=tx.amount,
+                    ceiling=tx.ceiling,
+                    remanent=rem
+                )
+            )
 
     # Step 3: Compute returns
     processed_txs = []
@@ -205,8 +254,7 @@ def calculate_returns(req: ReturnsRequest, rate: float, is_nps: bool):
             "end": k.end,
             "amount": round(k_sum, 2),
             "profit": round(real_fv - k_sum, 2),
-            "taxBenefit": round(tax_benefit, 2),
-            "inflation_adjusted_value": round(real_fv, 2)
+            "taxBenefit": round(tax_benefit, 2)
         })
 
     return {
