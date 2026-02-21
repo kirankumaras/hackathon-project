@@ -5,7 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: blk-hacking-ind-kiran-as
+    image: kirankumaras/hackathon-docker:latest
+
     ports:
       - "5477:5477"
     volumes:
