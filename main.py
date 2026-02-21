@@ -1,45 +1,235 @@
-from fastapi import FastAPI, Query
-import numpy as np
+import time
+import psutil
+import threading
+import os
+import math
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Dict
 
-app = FastAPI(title="Hacking India 26: Advanced Retirement Engine")
+app = FastAPI(title="Hacking India 26: BlackRock Challenge V1")
 
-# Asset DNA: [Risk, Return, Tax_Save, Liquidity, Expense_Ratio]
-ASSET_DB = {
-    "NPS (Pension)": [0.2, 0.10, 1.0, 0.1, 0.01],
-    "Nifty 50 ETF": [0.6, 0.13, 0.4, 0.9, 0.05],
-    "Gold (SGB)": [0.4, 0.09, 0.7, 0.6, 0.02],
-    "Fixed Deposit": [0.1, 0.06, 0.0, 0.8, 0.00],
-    "Crypto (BTC)": [1.0, 0.25, 0.0, 1.0, 0.15]
-}
+# ---------------------------------------------------------
+# Utility Functions
+# ---------------------------------------------------------
 
-@app.get("/simulate-roundup")
-def simulate(transaction_amount: float, period: int = 20, risk_val: float = 0.5):
-    # 1. Roundup Logic
-    rounded = np.ceil(transaction_amount / 10) * 10
-    savings = round(rounded - transaction_amount, 2)
-    
-    # 2. Diversification Algorithm
-    allocations = {}
-    total_suitability = 0
-    for name, attr in ASSET_DB.items():
-        risk_match = 1 - abs(attr[0] - risk_val)
-        time_factor = attr[2] if period > 10 else attr[3] # Tax vs Liquidity
-        score = (risk_match * 0.5) + (time_factor * 0.5) - attr[4]
-        allocations[name] = max(score, 0.1)
-        total_suitability += allocations[name]
+def parse_date(date_str: str) -> datetime:
+    """Parse date string into datetime object with validation."""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise ValueError(f"Invalid date-time format or non-existent date: {date_str}")
 
-    # 3. Final Portfolio & Real Value Calculation
-    portfolio = {k: round((v/total_suitability) * savings, 2) for k, v in allocations.items()}
-    nominal_future = savings * (1 + 0.10)**period # Avg 10% return
-    real_future = nominal_future / (1 + 0.06)**period # 6% Inflation adj
-    
+# ---------------------------------------------------------
+# Models based on Challenge Specs
+# ---------------------------------------------------------
+
+class Period(BaseModel):
+    start: str
+    end: str
+    fixed: Optional[float] = 0.0
+    extra: Optional[float] = 0.0
+
+    @validator('start', 'end')
+    def validate_dates(cls, v):
+        parse_date(v)  # ensures validity
+        return v
+
+class SimpleTransaction(BaseModel):
+    date: str
+    amount: float
+
+class Transaction(BaseModel):
+    """Used specifically for Validator  endpoint"""
+    date: str
+    amount: float
+    ceiling: float
+    remanent: float
+
+class ValidatorRequest(BaseModel):
+    wage: float
+    transactions: List[Transaction]
+
+class FilterRequest(BaseModel):
+    q: List[Period] = []
+    p: List[Period] = []
+    k: List[Period] = []
+    transactions: List[SimpleTransaction]
+
+class ReturnsRequest(BaseModel):
+    """Input structure for NPS and Index returns as per Challenge Doc"""
+    age: int
+    wage: float
+    inflation: float
+    q: List[Period] = []
+    p: List[Period] = []
+    k: List[Period] = []
+    transactions: List[SimpleTransaction]
+
+# ---------------------------------------------------------
+# Logic Engines
+# ---------------------------------------------------------
+
+def calculate_tax(income: float) -> float:
+    """Simplified progressive tax calculation."""
+    if income <= 700000:
+        return 0
+    tax = 0
+    curr = income
+    if curr > 1500000:
+        tax += (curr - 1500000) * 0.30
+        curr = 1500000
+    if curr > 1200000:
+        tax += (curr - 1200000) * 0.20
+        curr = 1200000
+    if curr > 1000000:
+        tax += (curr - 1000000) * 0.15
+        curr = 1000000
+    if curr > 700000:
+        tax += (curr - 700000) * 0.10
+    return tax
+
+
+def compute_ceiling_and_remanent(expenses: List[SimpleTransaction]) -> List[Transaction]:
+    return [
+        Transaction(
+            date=e.date,
+            amount=e.amount,
+            ceiling=float(math.ceil(e.amount / 100) * 100),
+            remanent=round((math.ceil(e.amount / 100) * 100) - e.amount, 2)
+        )
+        for e in expenses
+    ]
+
+def validate_and_enrich_transactions(transactions: List[SimpleTransaction]) -> Dict[str, List[Dict]]:
+    valid, invalid, seen = [], [], set()
+
+    enriched = compute_ceiling_and_remanent(transactions)
+
+    for tx in enriched:
+        key = (tx.date, tx.amount)
+
+        if tx.amount < 0:
+            invalid.append({**tx.dict(), "message": "Negative amounts are not allowed"})
+        elif key in seen:
+            invalid.append({**tx.dict(), "message": "Duplicate transaction"})
+        else:
+            seen.add(key)
+            valid.append(tx)
+
+    return {"valid": valid, "invalid": invalid}
+
+# ---------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------
+
+
+@app.post("/blackrock/challenge/v1/transactions:parse")
+def parse_transactions(expenses: List[SimpleTransaction]):
+    """Parse transactions into ceiling and remanent values using shared logic."""
+    return compute_ceiling_and_remanent(expenses)
+
+@app.post("/blackrock/challenge/v1/transactions:validator")
+def validate_transactions(req: ValidatorRequest):
+    result = validate_and_enrich_transactions([
+        SimpleTransaction(date=tx.date, amount=tx.amount)
+        for tx in req.transactions
+    ])
+    return result
+
+@app.post("/blackrock/challenge/v1/transactions:filter")
+def filter_transactions(req: FilterRequest):
+    # Step 1: Validate and enrich transactions
+    result = validate_and_enrich_transactions([
+        SimpleTransaction(date=tx.date, amount=tx.amount)
+        for tx in req.transactions
+    ])
+
+    valid, invalid = [], result["invalid"]
+
+    # Step 2: Apply k-period filtering to valid transactions
+    for tx in result["valid"]:
+        tx_dt = parse_date(tx.date)
+        in_k = any(parse_date(k.start) <= tx_dt <= parse_date(k.end) for k in req.k)
+
+        if in_k:
+            valid.append({**tx.dict(), "inKPeriod": True})
+        else:
+            invalid.append({**tx.dict(), "message": "Transaction does not fall within any k-period"})
+
+    return {"valid": valid, "invalid": invalid}
+
+def calculate_returns(req: ReturnsRequest, rate: float, is_nps: bool):
+    # Step 1: Validate and enrich transactions
+    validation_result = validate_and_enrich_transactions([
+        SimpleTransaction(date=tx.date, amount=tx.amount)
+        for tx in req.transactions
+    ])
+    valid_transactions = validation_result["valid"]
+
+    # Step 2: Apply k-period filtering
+    filtered_transactions = []
+    for tx in valid_transactions:
+        tx_dt = parse_date(tx.date)
+        if any(parse_date(k.start) <= tx_dt <= parse_date(k.end) for k in req.k):
+            filtered_transactions.append(tx)
+
+    # Step 3: Compute returns
+    processed_txs = []
+    total_ceiling = sum(tx.ceiling for tx in filtered_transactions)
+    years = 60 - req.age if req.age < 60 else 5
+    annual_income = req.wage * 12
+
+    for tx in filtered_transactions:
+        processed_txs.append({
+            "dt": parse_date(tx.date),
+            "rem": tx.remanent
+        })
+
+    savings_by_dates = []
+    for k in req.k:
+        k_s, k_e = parse_date(k.start), parse_date(k.end)
+        k_sum = sum(t['rem'] for t in processed_txs if k_s <= t['dt'] <= k_e)
+
+        nominal_fv = k_sum * ((1 + rate) ** years)
+        real_fv = nominal_fv / ((1 + (req.inflation / 100)) ** years)
+
+        tax_benefit = 0
+        if is_nps:
+            deduction = min(k_sum, 0.10 * annual_income, 200000)
+            tax_benefit = calculate_tax(annual_income) - calculate_tax(annual_income - deduction)
+
+        savings_by_dates.append({
+            "start": k.start,
+            "end": k.end,
+            "amount": round(k_sum, 2),
+            "profit": round(real_fv - k_sum, 2),
+            "taxBenefit": round(tax_benefit, 2),
+            "inflation_adjusted_value": round(real_fv, 2)
+        })
+
     return {
-        "saved_today": f"₹{savings}",
-        "diversification": portfolio,
-        "projection": {
-            "period_years": period,
-            "future_nominal_value": round(nominal_future, 2),
-            "purchasing_power_today": round(real_future, 2)
-        },
-        "message": "By automating micro-savings, you beat inflation and secure retirement."
+        "transactionsTotalAmount": sum(tx.amount for tx in valid_transactions),
+        "transactionsTotalCeiling": total_ceiling,
+        "savingsByDates": savings_by_dates
+    }
+
+@app.post("/blackrock/challenge/v1/returns:nps")
+def nps_returns(req: ReturnsRequest):
+    return calculate_returns(req, 0.0711, True)
+
+@app.post("/blackrock/challenge/v1/returns:index")
+def index_returns(req: ReturnsRequest):
+    return calculate_returns(req, 0.1449, False)
+
+@app.get("/blackrock/challenge/v1/performance")
+def performance():
+    """Report system performance metrics."""
+    proc = psutil.Process(os.getpid())
+    return {
+        "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "memory": f"{proc.memory_info().rss / (1024 * 1024):.2f} MB",
+        "threads": threading.active_count(),
+        "cpu": proc.cpu_percent(interval=0.1)
     }

@@ -1,3 +1,6 @@
+# Build image with participant details
+# docker build -t blk-hacking-ind-kiran-as .
+
 FROM python:3.9-slim
 WORKDIR /app
 COPY . .
