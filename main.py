@@ -188,15 +188,25 @@ def filter_transactions(req: FilterRequest):
 
     valid, invalid = [], result["invalid"]
 
-    # Step 2: Apply k-period filtering to valid transactions
+    # Step 2: Apply k-period filtering + Q/P remanent logic
     for tx in result["valid"]:
         tx_dt = parse_date(tx.date)
         in_k = any(parse_date(k.start) <= tx_dt <= parse_date(k.end) for k in req.k)
 
         if in_k:
-            valid.append({**tx.dict(), "inKPeriod": True})
+            # Apply Q/P rules if transaction date falls in those ranges
+            rem = process_remanent_logic(tx.date, tx.amount, req.q, req.p)
+
+            valid.append({
+                **tx.dict(),
+                "inKPeriod": True,
+                "remanent": rem
+            })
         else:
-            invalid.append({**tx.dict(), "message": "Transaction does not fall within any k-period"})
+            invalid.append({
+                **tx.dict(),
+                "message": "Transaction does not fall within any k-period"
+            })
 
     return {"valid": valid, "invalid": invalid}
 
