@@ -58,5 +58,5 @@ Access endpoints: http://localhost:5477
 
 alternative:
 
-docker pull kirankumarashackathon-docker:latest
+docker pull kirankumaras/hackathon-docker:latest
 docker run -p 5477:5477 kirankumaras/hackathon-docker:latest
